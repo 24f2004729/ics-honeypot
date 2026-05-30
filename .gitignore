@@ -1,0 +1,5 @@
+logs/honeypot.log 
+logs/events.jsonl 
+logs/report.html 
+__pycache__/ 
+*.pyc 
