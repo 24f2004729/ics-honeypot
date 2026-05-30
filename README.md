@@ -173,14 +173,3 @@ All configuration is in `honeypot/shared/config.py`:
 - **Add scanner fingerprints** — `KNOWN_SCANNERS` dict
 
 ---
-
-## Security Note
-
-This honeypot is for **research and education only**. Deploy it in an isolated lab environment or a dedicated honeypot network segment. Do not expose it to the public internet without proper network controls.
-
----
-
-## Author
-
-Built during internship at **Bharat Electronics Limited (BEL)** as part of ICS/OT cybersecurity research.
-Extends the multi-protocol SCADA simulation (Modbus TCP + DNP3 + MQTT) developed for IT/OT network segmentation studies.
