@@ -10,24 +10,24 @@ Built entirely in **pure Python (stdlib only)** — no third-party dependencies.
 
 ```
                     ┌─────────────────────────────────────────┐
-                    │            ICS Honeypot                  │
+                    │            ICS Honeypot                 │
                     │                                         │
-  Attacker ──────► │  ┌──────────┐  ┌───────┐  ┌──────────┐ │
-  (Scanner /        │  │ Modbus   │  │ DNP3  │  │  MQTT    │ │
-   Shodan /         │  │ TCP :502 │  │ :20000│  │  :1883   │ │
-   Pen-tester)      │  └────┬─────┘  └───┬───┘  └────┬─────┘ │
-                    │       │            │            │        │
-                    │       └────────────┴────────────┘        │
-                    │                   │                      │
+  Attacker ──────►  │  ┌──────────┐  ┌───────┐  ┌──────────┐  │
+  (Scanner /        │  │ Modbus   │  │ DNP3  │  │  MQTT    │  │
+   Shodan /         │  │ TCP :502 │  │ :20000│  │  :1883   │  │
+   Pen-tester)      │  └────┬─────┘  └───┬───┘  └────┬─────┘  │
+                    │       │            │            │       │
+                    │       └────────────┴────────────┘       │
+                    │                   │                     │
                     │         ┌─────────▼──────────┐          │
-                    │         │  Structured Logger  │          │
-                    │         │  honeypot.log       │          │
-                    │         │  events.jsonl       │          │
+                    │         │  Structured Logger  │         │
+                    │         │  honeypot.log       │         │
+                    │         │  events.jsonl       │         │
                     │         └─────────┬──────────┘          │
-                    │                   │                      │
+                    │                   │                     │
                     │         ┌─────────▼──────────┐          │
-                    │         │   HTML Reporter     │          │
-                    │         │   report.html       │          │
+                    │         │   HTML Reporter     │         │
+                    │         │   report.html       │         │
                     │         └────────────────────┘          │
                     └─────────────────────────────────────────┘
 ```
@@ -37,7 +37,7 @@ Built entirely in **pure Python (stdlib only)** — no third-party dependencies.
 ## Features
 
 | Feature | Details |
-|---|---|
+
 | **Modbus TCP** | Handles FC01–FC06, FC08, FC10, FC43 (MEI Device ID). Returns fake Siemens S7-1200 identity |
 | **DNP3** | Parses Data Link + Application layers. Handles Class 0/1/2/3 polls, OPERATE, DIRECT OPERATE |
 | **MQTT** | Full CONNECT parsing (extracts credentials). SUBSCRIBE, PUBLISH, PING supported |
