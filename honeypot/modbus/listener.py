@@ -211,6 +211,9 @@ class ModbusListener:
             return bytes([FC_EXCEPTION_FLAG | FC_READ_HOLDING_REGISTERS, EX_ILLEGAL_DATA_VALUE])
 
         start_addr, quantity = struct.unpack_from(">HH", payload, 0)
+        if quantity < 1 or quantity > 125:
+            return bytes([FC_EXCEPTION_FLAG | FC_READ_HOLDING_REGISTERS, EX_ILLEGAL_DATA_VALUE])
+
         log.attack(ip, port, "read_holding_registers", raw, {
             "function_code": "0x03",
             "start_address": start_addr,
@@ -237,6 +240,9 @@ class ModbusListener:
             return bytes([FC_EXCEPTION_FLAG | FC_READ_INPUT_REGISTERS, EX_ILLEGAL_DATA_VALUE])
 
         start_addr, quantity = struct.unpack_from(">HH", payload, 0)
+        if quantity < 1 or quantity > 125:
+            return bytes([FC_EXCEPTION_FLAG | FC_READ_INPUT_REGISTERS, EX_ILLEGAL_DATA_VALUE])
+
         log.attack(ip, port, "read_input_registers", raw, {
             "function_code": "0x04",
             "start_address": start_addr,
@@ -252,6 +258,9 @@ class ModbusListener:
             return bytes([FC_EXCEPTION_FLAG | FC_READ_COILS, EX_ILLEGAL_DATA_VALUE])
 
         start_addr, quantity = struct.unpack_from(">HH", payload, 0)
+        if quantity < 1 or quantity > 2000:
+            return bytes([FC_EXCEPTION_FLAG | FC_READ_COILS, EX_ILLEGAL_DATA_VALUE])
+
         log.attack(ip, port, "read_coils", raw, {
             "function_code": "0x01",
             "start_address": start_addr,
@@ -273,6 +282,9 @@ class ModbusListener:
             return bytes([FC_EXCEPTION_FLAG | FC_READ_DISCRETE_INPUTS, EX_ILLEGAL_DATA_VALUE])
 
         start_addr, quantity = struct.unpack_from(">HH", payload, 0)
+        if quantity < 1 or quantity > 2000:
+            return bytes([FC_EXCEPTION_FLAG | FC_READ_DISCRETE_INPUTS, EX_ILLEGAL_DATA_VALUE])
+
         log.attack(ip, port, "read_discrete_inputs", raw, {
             "function_code": "0x02",
             "start_address": start_addr,
@@ -338,8 +350,16 @@ class ModbusListener:
         })
         return bytes([FC_WRITE_MULTIPLE_REGISTERS]) + struct.pack(">HH", start_addr, quantity)
 
-    def _fc08_diagnostics(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
+    def _fc08_diagnostics(self, ip: str, port: int, payload: bytes, raw: bytes) -> Optional[bytes]:
         sub_func = struct.unpack_from(">H", payload, 0)[0] if len(payload) >= 2 else 0
+        if sub_func == 0x0004:
+            log.attack(ip, port, "FORCE_LISTEN_ONLY [HIGH]", raw, {
+                "function_code": "0x08",
+                "sub_function": "0x0004",
+                "note": "Force Listen Only Mode DoS attempt"
+            })
+            return None  # Standard Modbus: In Listen Only Mode, slave returns no response
+
         log.attack(ip, port, "diagnostics_request", raw, {
             "function_code": "0x08",
             "sub_function": sub_func,

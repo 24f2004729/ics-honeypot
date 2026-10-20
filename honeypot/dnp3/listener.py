@@ -169,6 +169,11 @@ class DNP3Listener:
                         break
 
                     dl_length = buffer[2]
+                    if dl_length < 5:
+                        # Corrupted/fuzzed length: discard sync bytes and search for next frame
+                        buffer = buffer[2:]
+                        continue
+
                     # Total frame length = 3 bytes (sync1, sync2, len) + dl_length
                     total_frame = 3 + dl_length
 
