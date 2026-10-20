@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  ics-honeypot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ics-honeypot:latest
+    container_name: ics-honeypot
+    restart: unless-stopped
+    ports:
+      # Modbus TCP (standard SCADA port)
+      - "502:502"
+      # DNP3 (IEEE 1815 Outstation)
+      - "20000:20000"
+      # MQTT (SCADA IoT Broker)
+      - "1883:1883"
+    environment:
+      - MODBUS_PORT=502
+      - DNP3_PORT=20000
+      - MQTT_PORT=1883
+      - DEVICE_PROFILE=moxa
+      - SOCKET_TIMEOUT=30
+      - MAX_ACTIVE_CONNECTIONS=100
+      - MAX_CONNS_PER_IP=10
+      # Optional: integrate Slack/Discord/Webhook alert notifications
+      # - ALERT_WEBHOOK_URL=https://discord.com/api/webhooks/...
+    volumes:
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+    cap_add:
+      - NET_BIND_SERVICE

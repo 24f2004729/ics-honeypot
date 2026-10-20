@@ -1,0 +1,25 @@
+[Unit]
+Description=ICS Multi-Protocol Honeypot & SCADA Decoy
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=honeypot
+Group=honeypot
+WorkingDirectory=/opt/ics-honeypot
+ExecStart=/usr/bin/python3 main.py
+Restart=always
+RestartSec=5
+
+# Security Hardening & Sandboxing
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/ics-honeypot/logs
+
+[Install]
+WantedBy=multi-user.target

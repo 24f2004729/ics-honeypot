@@ -1,486 +1,380 @@
 # =============================================================================
 #  ics_honeypot / modbus / listener.py
 #  ---------------------------------------------------------------------------
-#  Modbus TCP Honeypot Listener
+#  Modbus TCP (IEC 61158) Honeypot Listener
 #  ---------------------------------------------------------------------------
-#  Implements a convincing fake Modbus TCP slave that:
-#    • Accepts connections on port 502 (configurable)
-#    • Parses the 7-byte MBAP header + PDU correctly
-#    • Handles the most common function codes an attacker would use
-#    • Returns realistic fake sensor register values
-#    • Logs every request with full decoded fields to both log file and JSONL
-#
-#  Modbus TCP Frame Structure (for reference):
-#  ┌─────────────────────────────────────────────────────────┐
-#  │  MBAP Header (7 bytes)          │  PDU (variable)       │
-#  │  ┌──────┬──────┬────────┬────┐  │  ┌──────┬──────────┐  │
-#  │  │TxnID │Proto │Length  │UID │  │  │ FC   │ Data     │  │
-#  │  │2B    │2B    │2B      │1B  │  │  │ 1B   │ variable │  │
-#  │  └──────┴──────┴────────┴────┘  │  └──────┴──────────┘  │
-#  └─────────────────────────────────────────────────────────┘
-#  TxnID  = Transaction Identifier (echoed back in response)
-#  Proto  = Protocol Identifier (always 0x0000 for Modbus)
-#  Length = byte count of remaining message (UID + PDU)
-#  UID    = Unit Identifier (slave/device address)
-#  FC     = Function Code
+#  Features:
+#    • Full TCP stream reassembly (handles segmented / concatenated frames)
+#    • Dynamic process simulator integration (thermodynamic drift & actuator loop)
+#    • Interactive actuator state: FC05 writes dynamically change physical telemetry!
+#    • Function codes: FC01, FC02, FC03, FC04, FC05, FC06, FC16, FC08, FC43 (MEI)
+#    • Anti-DoS connection limits and buffer boundaries
+#    • Full MITRE ATT&CK for ICS classification
 # =============================================================================
 
 import socket
 import struct
 import threading
+from typing import Tuple, Optional, Dict, Any
 
-from honeypot.shared.config  import MODBUS_PORT, SOCKET_BACKLOG, SOCKET_TIMEOUT, RECV_BUFFER
-from honeypot.shared.config  import MODBUS_REGISTER_MAP, MODBUS_VENDOR, MODBUS_PRODUCT, MODBUS_VERSION
-from honeypot.shared.logger  import HoneypotLogger
+from honeypot.shared.config import (
+    MODBUS_PORT, SOCKET_BACKLOG, SOCKET_TIMEOUT, RECV_BUFFER, MAX_BUFFER_SIZE,
+    MODBUS_VENDOR, MODBUS_PRODUCT, MODBUS_VERSION
+)
+from honeypot.shared.logger import HoneypotLogger
+from honeypot.shared.guard import guard
+from honeypot.simulation.process import simulator
 
 log = HoneypotLogger("Modbus")
 
-# ---------------------------------------------------------------------------
-# Modbus Function Code constants — only the codes relevant to a honeypot
-# ---------------------------------------------------------------------------
+# Modbus Function Codes
 FC_READ_COILS               = 0x01
 FC_READ_DISCRETE_INPUTS     = 0x02
-FC_READ_HOLDING_REGISTERS   = 0x03   # most common scan target
+FC_READ_HOLDING_REGISTERS   = 0x03
 FC_READ_INPUT_REGISTERS     = 0x04
 FC_WRITE_SINGLE_COIL        = 0x05
 FC_WRITE_SINGLE_REGISTER    = 0x06
-FC_WRITE_MULTIPLE_REGISTERS = 0x10
 FC_DIAGNOSTICS              = 0x08
-FC_MEI_TRANSPORT            = 0x2B   # device identification request
+FC_WRITE_MULTIPLE_REGISTERS = 0x10
+FC_MEI_TRANSPORT            = 0x2B
 
-# Exception code — OR'd with FC to indicate an error response
+# Exception Codes
 FC_EXCEPTION_FLAG           = 0x80
-
-# Modbus exception codes
 EX_ILLEGAL_FUNCTION         = 0x01
 EX_ILLEGAL_DATA_ADDRESS     = 0x02
 EX_ILLEGAL_DATA_VALUE       = 0x03
 
 
-# =============================================================================
-#  ModbusListener — TCP server that spawns a thread per client connection
-# =============================================================================
-
 class ModbusListener:
     """
-    Fake Modbus TCP slave.  Runs in its own daemon thread.
-    Spawns a child thread for each attacker connection so multiple
-    scanners can be handled concurrently without blocking each other.
+    Industrial-grade Modbus TCP Honeypot with streaming frame reassembly.
     """
 
     def __init__(self, host: str = "0.0.0.0", port: int = MODBUS_PORT):
         self.host = host
         self.port = port
         self._stop_event = threading.Event()
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+        self._server_socket: Optional[socket.socket] = None
 
     def start(self):
-        """Start the listener in a background daemon thread."""
         t = threading.Thread(target=self._serve, daemon=True, name="ModbusListener")
         t.start()
         log.info(f"Listening on {self.host}:{self.port}")
 
     def stop(self):
-        """Signal the listener to stop accepting new connections."""
         self._stop_event.set()
-
-    # ------------------------------------------------------------------
-    # Server loop
-    # ------------------------------------------------------------------
+        if self._server_socket:
+            try:
+                self._server_socket.close()
+            except Exception:
+                pass
 
     def _serve(self):
-        """
-        Main accept loop.  Creates the server socket, then blocks on
-        accept() until a client connects.  Each client gets its own thread.
-        """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            # SO_REUSEADDR lets us restart the honeypot without waiting
-            # for the OS TIME_WAIT state to expire on port 502
+            self._server_socket = server
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((self.host, self.port))
             server.listen(SOCKET_BACKLOG)
-            server.settimeout(1.0)   # 1 s timeout so _stop_event is checked
+            server.settimeout(1.0)
 
             while not self._stop_event.is_set():
                 try:
                     conn, addr = server.accept()
                 except socket.timeout:
-                    continue   # loop back and check stop event
+                    continue
                 except OSError:
                     break
 
-                # Spawn a dedicated thread for this attacker session
+                ip, port = addr
+                if not guard.acquire(ip):
+                    # Connection limit exceeded — protect honeypot against DoS
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    continue
+
                 t = threading.Thread(
                     target=self._handle_client,
                     args=(conn, addr),
                     daemon=True,
-                    name=f"Modbus-{addr[0]}"
+                    name=f"Modbus-{ip}:{port}"
                 )
                 t.start()
 
-    # ------------------------------------------------------------------
-    # Per-client session handler
-    # ------------------------------------------------------------------
-
-    def _handle_client(self, conn: socket.socket, addr: tuple):
-        """
-        Receive Modbus frames from one attacker, decode them, respond with
-        fake data, and log everything.  Runs until the attacker disconnects
-        or the socket times out.
-        """
+    def _handle_client(self, conn: socket.socket, addr: Tuple[str, int]):
         ip, port = addr
         log.connection(ip, port)
-
         conn.settimeout(SOCKET_TIMEOUT)
 
-        try:
-            while True:
-                raw = conn.recv(RECV_BUFFER)
-                if not raw:
-                    break   # attacker closed the connection
+        buffer = b""
 
-                # A single recv() may deliver multiple concatenated frames
-                # (TCP is a stream protocol).  Process all frames in the buffer.
-                offset = 0
-                while offset < len(raw):
-                    consumed, response = self._process_frame(ip, port, raw[offset:])
-                    if consumed == 0:
-                        break   # incomplete frame — wait for more data
-                    offset += consumed
+        try:
+            while not self._stop_event.is_set():
+                chunk = conn.recv(RECV_BUFFER)
+                if not chunk:
+                    break
+
+                buffer += chunk
+
+                # Anti-DoS: drop connection if buffer exceeds maximum threshold without valid framing
+                if len(buffer) > MAX_BUFFER_SIZE:
+                    log.error(ip, port, "Buffer threshold exceeded — dropping connection to prevent DoS")
+                    break
+
+                # Frame Reassembly Loop: Parse all complete Modbus frames in buffer
+                while len(buffer) >= 7:
+                    txn_id, proto_id, length = struct.unpack_from(">HHH", buffer, 0)
+
+                    # Protocol ID must be 0x0000 for Modbus TCP
+                    if proto_id != 0x0000:
+                        log.error(ip, port, f"Invalid Modbus protocol ID: 0x{proto_id:04X} — non-Modbus probe")
+                        buffer = b""
+                        break
+
+                    total_frame = 6 + length
+                    if len(buffer) < total_frame:
+                        # Fragmented TCP packet: wait for remaining bytes
+                        break
+
+                    # Extract one complete Modbus frame
+                    frame_data = buffer[:total_frame]
+                    buffer = buffer[total_frame:]
+
+                    response = self._process_frame(ip, port, frame_data)
                     if response:
                         conn.sendall(response)
 
-        except socket.timeout:
-            pass   # attacker went idle — normal, not an error
-        except ConnectionResetError:
-            pass   # attacker hard-reset the TCP connection
+        except (socket.timeout, ConnectionResetError):
+            pass
         except Exception as exc:
-            log.error(ip, port, f"Unexpected exception: {exc}")
+            log.error(ip, port, f"Unexpected exception in client handler: {exc}")
         finally:
-            conn.close()
+            guard.release(ip)
+            try:
+                conn.close()
+            except Exception:
+                pass
             log.disconnection(ip, port)
 
-    # ------------------------------------------------------------------
-    # Frame parser and dispatcher
-    # ------------------------------------------------------------------
-
-    def _process_frame(self, ip: str, port: int, data: bytes) -> tuple[int, bytes | None]:
-        """
-        Parse one Modbus TCP frame from `data`.
-
-        Returns
-        -------
-        (bytes_consumed, response_bytes)
-            bytes_consumed == 0 means the frame is incomplete (need more data).
-            response_bytes == None means we deliberately send no reply.
-        """
-        # MBAP header is exactly 7 bytes — if we have fewer, wait for more
-        if len(data) < 7:
-            return 0, None
-
-        # Unpack MBAP header
-        # >HHH = big-endian: uint16, uint16, uint16
+    def _process_frame(self, ip: str, port: int, data: bytes) -> Optional[bytes]:
+        """Process a complete, reassembled Modbus frame."""
         txn_id, proto_id, length = struct.unpack_from(">HHH", data, 0)
         unit_id = data[6]
+        pdu = data[7:]
 
-        # Protocol ID must always be 0x0000 for Modbus TCP.
-        # Non-zero values indicate a garbled frame or a protocol scanner.
-        if proto_id != 0x0000:
-            log.error(ip, port, f"Non-Modbus protocol ID: 0x{proto_id:04X} — possible scanner")
-            return len(data), None   # consume and discard
-
-        # 'length' includes the Unit ID byte, so total frame = 6 (MBAP without length) + length
-        total_frame = 6 + length
-        if len(data) < total_frame:
-            return 0, None   # incomplete frame
-
-        # PDU starts at byte 7 (after the 7-byte MBAP header)
-        pdu = data[7:total_frame]
         if not pdu:
-            return total_frame, None
+            return None
 
-        function_code = pdu[0]
-        payload       = pdu[1:]   # everything after the function code
+        fc = pdu[0]
+        payload = pdu[1:]
 
-        # Dispatch to the appropriate handler based on function code
-        response_pdu = self._dispatch(ip, port, function_code, payload, txn_id, unit_id, data[:total_frame])
-
+        response_pdu = self._dispatch(ip, port, fc, payload, data)
         if response_pdu is None:
-            return total_frame, None
+            return None
 
-        # Build the response MBAP header:
-        # TxnID (echo) | ProtoID 0x0000 | Length (PDU size + 1 for UID) | UID
         resp_length = len(response_pdu) + 1
-        response = struct.pack(">HHHB", txn_id, 0x0000, resp_length, unit_id) + response_pdu
+        return struct.pack(">HHHB", txn_id, 0x0000, resp_length, unit_id) + response_pdu
 
-        return total_frame, response
-
-    def _dispatch(
-        self,
-        ip: str, port: int,
-        fc: int, payload: bytes,
-        txn_id: int, unit_id: int,
-        raw_frame: bytes
-    ) -> bytes | None:
-        """
-        Route a decoded PDU to the correct function-code handler.
-        Returns the response PDU (without MBAP header).
-        """
+    def _dispatch(self, ip: str, port: int, fc: int, payload: bytes, raw: bytes) -> Optional[bytes]:
         if fc == FC_READ_HOLDING_REGISTERS:
-            return self._fc03_read_holding_registers(ip, port, payload, raw_frame)
-
+            return self._fc03_read_holding(ip, port, payload, raw)
         elif fc == FC_READ_INPUT_REGISTERS:
-            return self._fc04_read_input_registers(ip, port, payload, raw_frame)
-
+            return self._fc04_read_input(ip, port, payload, raw)
         elif fc == FC_READ_COILS:
-            return self._fc01_read_coils(ip, port, payload, raw_frame)
-
+            return self._fc01_read_coils(ip, port, payload, raw)
         elif fc == FC_READ_DISCRETE_INPUTS:
-            return self._fc02_read_discrete_inputs(ip, port, payload, raw_frame)
-
-        elif fc == FC_WRITE_SINGLE_REGISTER:
-            return self._fc06_write_single_register(ip, port, payload, raw_frame)
-
-        elif fc == FC_WRITE_MULTIPLE_REGISTERS:
-            return self._fc16_write_multiple_registers(ip, port, payload, raw_frame)
-
+            return self._fc02_read_discrete(ip, port, payload, raw)
         elif fc == FC_WRITE_SINGLE_COIL:
-            return self._fc05_write_single_coil(ip, port, payload, raw_frame)
-
+            return self._fc05_write_coil(ip, port, payload, raw)
+        elif fc == FC_WRITE_SINGLE_REGISTER:
+            return self._fc06_write_register(ip, port, payload, raw)
+        elif fc == FC_WRITE_MULTIPLE_REGISTERS:
+            return self._fc16_write_multiple_registers(ip, port, payload, raw)
         elif fc == FC_DIAGNOSTICS:
-            return self._fc08_diagnostics(ip, port, payload, raw_frame)
-
+            return self._fc08_diagnostics(ip, port, payload, raw)
         elif fc == FC_MEI_TRANSPORT:
-            return self._fc43_mei(ip, port, payload, raw_frame)
-
+            return self._fc43_mei(ip, port, payload, raw)
         else:
-            # Unknown function code — return Illegal Function exception
-            log.attack(ip, port, f"unknown_fc_0x{fc:02X}", raw_frame, {
-                "function_code": fc,
+            log.attack(ip, port, f"unknown_fc_0x{fc:02X}", raw, {
+                "function_code": f"0x{fc:02X}",
                 "note": "Illegal Function exception returned"
             })
             return bytes([FC_EXCEPTION_FLAG | fc, EX_ILLEGAL_FUNCTION])
 
-    # ------------------------------------------------------------------
-    # Function Code Handlers
-    # ------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Handlers with Dynamic Physics Simulation
+    # -------------------------------------------------------------------------
 
-    def _fc03_read_holding_registers(self, ip, port, payload, raw):
-        """
-        FC 0x03 — Read Holding Registers.
-        Most common Modbus scan.  Returns fake sensor register values.
-
-        Request payload: start_address (2B) + quantity (2B)
-        Response:        byte_count (1B) + register_values (quantity × 2B)
-        """
+    def _fc03_read_holding(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
         if len(payload) < 4:
             return bytes([FC_EXCEPTION_FLAG | FC_READ_HOLDING_REGISTERS, EX_ILLEGAL_DATA_VALUE])
 
-        start_addr = struct.unpack_from(">H", payload, 0)[0]
-        quantity   = struct.unpack_from(">H", payload, 2)[0]
-
+        start_addr, quantity = struct.unpack_from(">HH", payload, 0)
         log.attack(ip, port, "read_holding_registers", raw, {
             "function_code": "0x03",
             "start_address": start_addr,
-            "quantity":      quantity
+            "quantity": quantity
         })
 
-        # Build response: return fake values for requested registers
-        register_bytes = b""
+        # Fetch live dynamic telemetry from physics process simulation
+        reg_map = simulator.get_holding_registers(start_addr, quantity)
+        reg_bytes = b""
+        logged_data = {}
+
         for i in range(quantity):
-            reg_idx = start_addr + i
-            if reg_idx in MODBUS_REGISTER_MAP:
-                _, value = MODBUS_REGISTER_MAP[reg_idx]
-                register_bytes += struct.pack(">H", value)
-            else:
-                register_bytes += struct.pack(">H", 0x0000)   # unallocated register = 0
+            addr = start_addr + i
+            name, val = reg_map[addr]
+            reg_bytes += struct.pack(">H", val)
+            if i < 8:
+                logged_data[name] = val
 
-        byte_count = len(register_bytes)
-        response_pdu = bytes([FC_READ_HOLDING_REGISTERS, byte_count]) + register_bytes
+        log.response(ip, port, "read_holding_registers", logged_data)
+        return bytes([FC_READ_HOLDING_REGISTERS, len(reg_bytes)]) + reg_bytes
 
-        # Build a human-readable dict of what we sent back for the log
-        fake_values = {
-            MODBUS_REGISTER_MAP[start_addr + i][0]: struct.unpack_from(">H", register_bytes, i * 2)[0]
-            for i in range(quantity) if (start_addr + i) in MODBUS_REGISTER_MAP
-        }
-        log.response(ip, port, "read_holding_registers", fake_values)
-
-        return response_pdu
-
-    def _fc04_read_input_registers(self, ip, port, payload, raw):
-        """
-        FC 0x04 — Read Input Registers.
-        Same register map as FC03 for our honeypot — attackers can't tell the difference.
-        """
+    def _fc04_read_input(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
         if len(payload) < 4:
             return bytes([FC_EXCEPTION_FLAG | FC_READ_INPUT_REGISTERS, EX_ILLEGAL_DATA_VALUE])
 
-        start_addr = struct.unpack_from(">H", payload, 0)[0]
-        quantity   = struct.unpack_from(">H", payload, 2)[0]
-
+        start_addr, quantity = struct.unpack_from(">HH", payload, 0)
         log.attack(ip, port, "read_input_registers", raw, {
             "function_code": "0x04",
             "start_address": start_addr,
-            "quantity":      quantity
+            "quantity": quantity
         })
 
-        register_bytes = b""
-        for i in range(quantity):
-            reg_idx = start_addr + i
-            _, value = MODBUS_REGISTER_MAP.get(reg_idx, ("unknown", 0))
-            register_bytes += struct.pack(">H", value)
+        reg_map = simulator.get_holding_registers(start_addr, quantity)
+        reg_bytes = b"".join(struct.pack(">H", reg_map[start_addr + i][1]) for i in range(quantity))
+        return bytes([FC_READ_INPUT_REGISTERS, len(reg_bytes)]) + reg_bytes
 
-        return bytes([FC_READ_INPUT_REGISTERS, len(register_bytes)]) + register_bytes
-
-    def _fc01_read_coils(self, ip, port, payload, raw):
-        """
-        FC 0x01 — Read Coils (digital outputs).
-        We return a fixed pattern of coil states to appear realistic.
-        """
+    def _fc01_read_coils(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
         if len(payload) < 4:
             return bytes([FC_EXCEPTION_FLAG | FC_READ_COILS, EX_ILLEGAL_DATA_VALUE])
 
-        start_addr = struct.unpack_from(">H", payload, 0)[0]
-        quantity   = struct.unpack_from(">H", payload, 2)[0]
-
+        start_addr, quantity = struct.unpack_from(">HH", payload, 0)
         log.attack(ip, port, "read_coils", raw, {
             "function_code": "0x01",
             "start_address": start_addr,
-            "quantity":      quantity
+            "quantity": quantity
         })
 
-        # Pack fake coil states as bits — 0xAA = 10101010 pattern
-        byte_count    = (quantity + 7) // 8
-        coil_bytes    = bytes([0xAA] * byte_count)
+        # Build bitfield from real simulated actuator states
+        byte_count = (quantity + 7) // 8
+        bitfield = 0
+        for i in range(quantity):
+            if simulator.get_coil(start_addr + i):
+                bitfield |= (1 << i)
+
+        coil_bytes = bitfield.to_bytes(byte_count, byteorder="little")
         return bytes([FC_READ_COILS, byte_count]) + coil_bytes
 
-    def _fc02_read_discrete_inputs(self, ip, port, payload, raw):
-        """FC 0x02 — Read Discrete Inputs (digital inputs)."""
+    def _fc02_read_discrete(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
         if len(payload) < 4:
             return bytes([FC_EXCEPTION_FLAG | FC_READ_DISCRETE_INPUTS, EX_ILLEGAL_DATA_VALUE])
 
-        start_addr = struct.unpack_from(">H", payload, 0)[0]
-        quantity   = struct.unpack_from(">H", payload, 2)[0]
-
+        start_addr, quantity = struct.unpack_from(">HH", payload, 0)
         log.attack(ip, port, "read_discrete_inputs", raw, {
             "function_code": "0x02",
             "start_address": start_addr,
-            "quantity":      quantity
+            "quantity": quantity
         })
 
         byte_count = (quantity + 7) // 8
-        return bytes([FC_READ_DISCRETE_INPUTS, byte_count]) + bytes([0x55] * byte_count)
+        bitfield = 0
+        for i in range(quantity):
+            if simulator.get_discrete_input(start_addr + i):
+                bitfield |= (1 << i)
 
-    def _fc06_write_single_register(self, ip, port, payload, raw):
+        return bytes([FC_READ_DISCRETE_INPUTS, byte_count]) + bitfield.to_bytes(byte_count, byteorder="little")
+
+    def _fc05_write_coil(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
         """
-        FC 0x06 — Write Single Register.
-        An attacker trying to write to us — high severity event.
-        We ACK the write (appear to accept it) but don't actually change anything.
+        FC 0x05 — Write Single Coil (Interactive actuator control).
+        Attacker command dynamically impacts simulated physical process!
         """
-        if len(payload) < 4:
-            return bytes([FC_EXCEPTION_FLAG | FC_WRITE_SINGLE_REGISTER, EX_ILLEGAL_DATA_VALUE])
-
-        reg_addr = struct.unpack_from(">H", payload, 0)[0]
-        value    = struct.unpack_from(">H", payload, 2)[0]
-
-        log.attack(ip, port, "WRITE_single_register [HIGH SEVERITY]", raw, {
-            "function_code":  "0x06",
-            "register":       reg_addr,
-            "value_written":  value,
-            "severity":       "HIGH"
-        })
-
-        # Echo back the address and value — standard Modbus ACK for FC06
-        return bytes([FC_WRITE_SINGLE_REGISTER]) + payload[:4]
-
-    def _fc16_write_multiple_registers(self, ip, port, payload, raw):
-        """
-        FC 0x10 — Write Multiple Registers.
-        Highest severity — attacker attempting bulk register write.
-        """
-        if len(payload) < 5:
-            return bytes([FC_EXCEPTION_FLAG | FC_WRITE_MULTIPLE_REGISTERS, EX_ILLEGAL_DATA_VALUE])
-
-        start_addr = struct.unpack_from(">H", payload, 0)[0]
-        quantity   = struct.unpack_from(">H", payload, 2)[0]
-
-        log.attack(ip, port, "WRITE_multiple_registers [CRITICAL SEVERITY]", raw, {
-            "function_code": "0x10",
-            "start_address": start_addr,
-            "quantity":      quantity,
-            "severity":      "CRITICAL"
-        })
-
-        # ACK: echo start address and quantity
-        return bytes([FC_WRITE_MULTIPLE_REGISTERS]) + struct.pack(">HH", start_addr, quantity)
-
-    def _fc05_write_single_coil(self, ip, port, payload, raw):
-        """FC 0x05 — Write Single Coil."""
         if len(payload) < 4:
             return bytes([FC_EXCEPTION_FLAG | FC_WRITE_SINGLE_COIL, EX_ILLEGAL_DATA_VALUE])
 
-        coil_addr = struct.unpack_from(">H", payload, 0)[0]
-        coil_val  = struct.unpack_from(">H", payload, 2)[0]  # 0xFF00 = ON, 0x0000 = OFF
+        coil_addr, coil_val = struct.unpack_from(">HH", payload, 0)
+        is_on = (coil_val == 0xFF00)
 
-        log.attack(ip, port, "WRITE_single_coil [HIGH SEVERITY]", raw, {
+        # Update physical process state
+        simulator.set_coil(coil_addr, is_on)
+
+        action_name = "Cooling Fan" if coil_addr == 0 else ("Emergency Cutoff" if coil_addr == 1 else f"Actuator #{coil_addr}")
+        log.attack(ip, port, "WRITE_single_coil [CRITICAL]", raw, {
             "function_code": "0x05",
-            "coil_address":  coil_addr,
-            "value":         "ON" if coil_val == 0xFF00 else "OFF",
-            "severity":      "HIGH"
+            "coil_address": coil_addr,
+            "value": "ON" if is_on else "OFF",
+            "actuator_target": action_name,
+            "severity": "CRITICAL"
         })
 
         return bytes([FC_WRITE_SINGLE_COIL]) + payload[:4]
 
-    def _fc08_diagnostics(self, ip, port, payload, raw):
-        """
-        FC 0x08 — Diagnostics.
-        Commonly used by scanners to fingerprint devices.
-        We respond with plausible counters to appear authentic.
-        """
-        sub_func = struct.unpack_from(">H", payload, 0)[0] if len(payload) >= 2 else 0
+    def _fc06_write_register(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
+        if len(payload) < 4:
+            return bytes([FC_EXCEPTION_FLAG | FC_WRITE_SINGLE_REGISTER, EX_ILLEGAL_DATA_VALUE])
 
-        log.attack(ip, port, "diagnostics_request", raw, {
-            "function_code":   "0x08",
-            "sub_function":    sub_func,
-            "note":            "Device fingerprinting attempt"
+        reg_addr, value = struct.unpack_from(">HH", payload, 0)
+        log.attack(ip, port, "WRITE_single_register [HIGH]", raw, {
+            "function_code": "0x06",
+            "register": reg_addr,
+            "value_written": value,
+            "severity": "HIGH"
         })
+        return bytes([FC_WRITE_SINGLE_REGISTER]) + payload[:4]
 
-        # Sub-function 0x0000 = Return Query Data (echo)
+    def _fc16_write_multiple_registers(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
+        if len(payload) < 5:
+            return bytes([FC_EXCEPTION_FLAG | FC_WRITE_MULTIPLE_REGISTERS, EX_ILLEGAL_DATA_VALUE])
+
+        start_addr, quantity = struct.unpack_from(">HH", payload, 0)
+        log.attack(ip, port, "WRITE_multiple_registers [CRITICAL]", raw, {
+            "function_code": "0x10",
+            "start_address": start_addr,
+            "quantity": quantity,
+            "severity": "CRITICAL"
+        })
+        return bytes([FC_WRITE_MULTIPLE_REGISTERS]) + struct.pack(">HH", start_addr, quantity)
+
+    def _fc08_diagnostics(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
+        sub_func = struct.unpack_from(">H", payload, 0)[0] if len(payload) >= 2 else 0
+        log.attack(ip, port, "diagnostics_request", raw, {
+            "function_code": "0x08",
+            "sub_function": sub_func,
+            "note": "PLC diagnostics / fingerprinting"
+        })
         return bytes([FC_DIAGNOSTICS]) + payload
 
-    def _fc43_mei(self, ip, port, payload, raw):
+    def _fc43_mei(self, ip: str, port: int, payload: bytes, raw: bytes) -> bytes:
         """
-        FC 0x2B — MEI Transport (Device Identification).
-        Scanners use this to read vendor name, product code, firmware version.
-        We return our fake Siemens SIMATIC identity strings.
+        FC 0x2B / MEI 0x0E — Read Device Identification.
+        Returns authentic vendor and model strings configured in active profile.
         """
         log.attack(ip, port, "device_identification_MEI", raw, {
             "function_code": "0x2B",
-            "note":          "Attacker requesting device identity — returning fake Siemens identity"
+            "profile_vendor": MODBUS_VENDOR,
+            "profile_product": MODBUS_PRODUCT
         })
 
-        # Build MEI response with fake identity objects
         def mei_object(obj_id: int, value: str) -> bytes:
             encoded = value.encode("ascii")
             return bytes([obj_id, len(encoded)]) + encoded
 
         objects = (
-            mei_object(0x00, MODBUS_VENDOR)  +
+            mei_object(0x00, MODBUS_VENDOR) +
             mei_object(0x01, MODBUS_PRODUCT) +
             mei_object(0x02, MODBUS_VERSION)
         )
 
-        # MEI response header: FC | MEI type | Read Device ID code | conformity | reserved | reserved | object count
         header = bytes([
             FC_MEI_TRANSPORT,
-            0x0E,          # MEI type: Read Device Identification
-            0x01,          # Read Device ID code
-            0x01,          # Conformity level
-            0x00,          # More follows: No
-            0x00,          # Next Object Id
-            0x03           # Number of objects
+            0x0E,   # MEI type: Read Device Identification
+            0x01,   # Read Device ID code: Basic identification
+            0x01,   # Conformity level: Basic stream access
+            0x00,   # More follows: No
+            0x00,   # Next Object Id: 0
+            0x03    # Number of objects: 3
         ])
         return header + objects

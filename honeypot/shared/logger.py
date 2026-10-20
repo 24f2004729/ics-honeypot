@@ -1,20 +1,14 @@
 # =============================================================================
 #  ics_honeypot / shared / logger.py
 #  ---------------------------------------------------------------------------
-#  Dual-output logging system for the ICS Honeypot.
-#
+#  Dual-Output Structured Logging & SIEM Ingestion Engine
+#  ---------------------------------------------------------------------------
 #  Every attacker interaction is written to TWO destinations simultaneously:
-#    1. honeypot.log  — human-readable, coloured console + rotating file
-#    2. events.jsonl  — machine-parseable JSON Lines (one JSON object per line)
+#    1. honeypot.log  — human-readable, ANSI-coloured console + rotating file
+#    2. events.jsonl  — machine-parseable JSON Lines with MITRE ATT&CK ICS tags
 #
-#  The JSON Lines format is intentional: it can be ingested directly into
-#  Splunk, ELK, or any SIEM without any parsing pipeline changes.
-#
-#  Usage (from any listener module):
-#      from honeypot.shared.logger import HoneypotLogger
-#      log = HoneypotLogger("Modbus")
-#      log.connection("192.168.1.50", 45231)
-#      log.attack("192.168.1.50", 45231, "read_registers", raw_bytes, details)
+#  Also supports asynchronous Webhook notifications (Slack/Discord/SIEM)
+#  for CRITICAL and HIGH severity events using pure Python stdlib.
 # =============================================================================
 
 import os
@@ -23,16 +17,18 @@ import logging
 import logging.handlers
 import datetime
 import threading
+import urllib.request
+import urllib.error
+from typing import Dict, Any, Optional
 
 from honeypot.shared.config import (
     LOG_DIR, LOG_FILE, EVENT_FILE,
     LOG_MAX_BYTES, LOG_BACKUP_COUNT,
-    KNOWN_SCANNERS
+    KNOWN_SCANNERS, ALERT_WEBHOOK_URL
 )
+from honeypot.shared.mitre import classify_mitre_attack
 
-# ---------------------------------------------------------------------------
-# ANSI colour codes — makes console output scannable at a glance
-# ---------------------------------------------------------------------------
+# ANSI color codes
 RESET   = "\033[0m"
 RED     = "\033[91m"
 YELLOW  = "\033[93m"
@@ -41,22 +37,11 @@ CYAN    = "\033[96m"
 MAGENTA = "\033[95m"
 BOLD    = "\033[1m"
 
-# ---------------------------------------------------------------------------
-# Module-level setup — runs once when the module is first imported
-# ---------------------------------------------------------------------------
-
-# Ensure the logs/ directory exists before any handler tries to open files
 os.makedirs(LOG_DIR, exist_ok=True)
-
-# Shared lock so concurrent listener threads don't interleave JSON writes
 _json_lock = threading.Lock()
 
 
 def _build_file_handler() -> logging.handlers.RotatingFileHandler:
-    """
-    Create a rotating file handler for honeypot.log.
-    Rotates at LOG_MAX_BYTES, keeping LOG_BACKUP_COUNT backups.
-    """
     handler = logging.handlers.RotatingFileHandler(
         LOG_FILE,
         maxBytes=LOG_MAX_BYTES,
@@ -71,11 +56,6 @@ def _build_file_handler() -> logging.handlers.RotatingFileHandler:
 
 
 def _build_console_handler() -> logging.StreamHandler:
-    """
-    Create a console handler that writes to stdout.
-    No colour codes are added here; colouring is done in HoneypotLogger
-    before the message reaches this handler.
-    """
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
         fmt="%(asctime)s  %(message)s",
@@ -84,146 +64,150 @@ def _build_console_handler() -> logging.StreamHandler:
     return handler
 
 
-# Root logger shared across all honeypot modules
 _root = logging.getLogger("honeypot")
 _root.setLevel(logging.DEBUG)
 _root.addHandler(_build_file_handler())
 _root.addHandler(_build_console_handler())
 
 
-# =============================================================================
-#  HoneypotLogger — per-protocol wrapper around the standard logger
-# =============================================================================
+def _dispatch_webhook_async(event: Dict[str, Any]):
+    """Send webhook alert asynchronously in a background thread without blocking."""
+    if not ALERT_WEBHOOK_URL:
+        return
+
+    def _worker():
+        try:
+            payload = json.dumps({
+                "content": (
+                    f"🚨 **ICS Honeypot Alert** [{event.get('severity', 'ALERT')}]\n"
+                    f"- **Protocol:** {event.get('protocol')}\n"
+                    f"- **Attacker:** `{event.get('src_ip')}:{event.get('src_port')}`\n"
+                    f"- **Action:** `{event.get('action')}`\n"
+                    f"- **MITRE:** {event.get('mitre_id')} ({event.get('mitre_name')})\n"
+                    f"- **Tactic:** {event.get('mitre_tactic')}"
+                )
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                ALERT_WEBHOOK_URL,
+                data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "ICSHoneypot/2.0"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
 
 class HoneypotLogger:
     """
-    Structured logger for one ICS protocol listener (Modbus, DNP3, or MQTT).
-
-    Each public method both:
-      • emits a human-readable line via the standard logging framework, and
-      • appends a JSON event to events.jsonl for SIEM ingestion.
+    Structured logger for ICS protocol listeners with MITRE ATT&CK integration.
     """
 
     def __init__(self, protocol: str):
-        """
-        Parameters
-        ----------
-        protocol : str
-            Short protocol label used as a prefix in every log line.
-            Recommended values: "Modbus", "DNP3", "MQTT".
-        """
         self.protocol = protocol.upper()
         self._logger  = logging.getLogger(f"honeypot.{protocol.lower()}")
 
-    # ------------------------------------------------------------------
-    # Public logging methods
-    # ------------------------------------------------------------------
-
     def connection(self, ip: str, port: int):
         """Log a new TCP connection from an attacker."""
-        scanner = self._identify_scanner(None)   # no bytes yet at connect time
-        msg = (
-            f"{CYAN}{BOLD}[{self.protocol}]{RESET} "
-            f"{GREEN}NEW CONNECTION{RESET}  "
-            f"{ip}:{port}"
-        )
+        msg = f"{CYAN}{BOLD}[{self.protocol}]{RESET} {GREEN}NEW CONNECTION{RESET}  {ip}:{port}"
         self._logger.info(msg)
-        self._write_event("connection", ip, port, {
-            "scanner_hint": scanner
-        })
+        self._write_event("connection", ip, port, {})
 
     def disconnection(self, ip: str, port: int):
-        """Log a client disconnecting (graceful or reset)."""
-        msg = (
-            f"{CYAN}[{self.protocol}]{RESET} "
-            f"DISCONNECT  {ip}:{port}"
-        )
+        """Log client disconnect."""
+        msg = f"{CYAN}[{self.protocol}]{RESET} DISCONNECT  {ip}:{port}"
         self._logger.info(msg)
         self._write_event("disconnection", ip, port, {})
 
     def attack(
         self,
-        ip:        str,
-        port:      int,
-        action:    str,
+        ip: str,
+        port: int,
+        action: str,
         raw_bytes: bytes,
-        details:   dict
+        details: Optional[Dict[str, Any]] = None
     ):
         """
-        Log a decoded attacker request — the most important event type.
-
-        Parameters
-        ----------
-        ip        : attacker IP address
-        port      : attacker source port
-        action    : human-readable description of what was attempted
-                    e.g. "read_holding_registers", "write_coil", "dnp3_read_class0"
-        raw_bytes : the exact bytes received (stored hex-encoded in JSON)
-        details   : protocol-specific decoded fields as a dict
+        Log a decoded attack request with MITRE ATT&CK taxonomy classification.
         """
+        details = details or {}
         scanner = self._identify_scanner(raw_bytes)
         hex_str = raw_bytes.hex(" ").upper() if raw_bytes else ""
 
-        # Colour-code by action severity
-        colour = RED if "write" in action.lower() else YELLOW
+        # Map to MITRE ATT&CK for ICS
+        mitre_info = classify_mitre_attack(action, details)
+
+        severity = details.get("severity")
+        if not severity:
+            action_up = action.upper()
+            if "CRITICAL" in action_up or "OPERATE" in action_up or "WRITE_MULTIPLE" in action_up:
+                severity = "CRITICAL"
+            elif "WRITE" in action_up or details.get("password"):
+                severity = "HIGH"
+            else:
+                severity = "MEDIUM"
+
+        colour = RED if severity in ("CRITICAL", "HIGH") else YELLOW
 
         msg = (
             f"{CYAN}{BOLD}[{self.protocol}]{RESET} "
-            f"{colour}PROBE{RESET}  "
+            f"{colour}PROBE [{severity}]{RESET}  "
             f"{ip}:{port}  "
             f"action={action}  "
-            f"bytes=[{hex_str[:60]}{'…' if len(hex_str) > 60 else ''}]"
+            f"MITRE={mitre_info['mitre_id']} ({mitre_info['mitre_name']})  "
+            f"bytes=[{hex_str[:50]}{'…' if len(hex_str) > 50 else ''}]"
         )
         if scanner:
             msg += f"  {MAGENTA}scanner={scanner}{RESET}"
 
         self._logger.warning(msg)
-        self._write_event("attack", ip, port, {
-            "action":      action,
-            "raw_hex":     raw_bytes.hex() if raw_bytes else "",
-            "byte_length": len(raw_bytes) if raw_bytes else 0,
-            "scanner":     scanner,
-            **details
-        })
 
-    def response(self, ip: str, port: int, action: str, fake_data: dict):
-        """Log the fake response we sent back to keep the attacker engaged."""
-        msg = (
-            f"{CYAN}[{self.protocol}]{RESET} "
-            f"{GREEN}RESPONDED{RESET}  "
-            f"{ip}:{port}  action={action}  data={fake_data}"
-        )
+        event_data = {
+            "action": action,
+            "raw_hex": raw_bytes.hex() if raw_bytes else "",
+            "byte_length": len(raw_bytes) if raw_bytes else 0,
+            "scanner": scanner,
+            "severity": severity,
+            **mitre_info,
+            **details
+        }
+        self._write_event("attack", ip, port, event_data)
+
+        if severity in ("CRITICAL", "HIGH"):
+            _dispatch_webhook_async({
+                "protocol": self.protocol,
+                "src_ip": ip,
+                "src_port": port,
+                "severity": severity,
+                "action": action,
+                **mitre_info
+            })
+
+    def response(self, ip: str, port: int, action: str, fake_data: Dict[str, Any]):
+        """Log honeypot decoy response."""
+        msg = f"{CYAN}[{self.protocol}]{RESET} {GREEN}RESPONDED{RESET}  {ip}:{port}  action={action}  data={fake_data}"
         self._logger.info(msg)
         self._write_event("response", ip, port, {
-            "action":    action,
+            "action": action,
             "fake_data": fake_data
         })
 
     def error(self, ip: str, port: int, message: str):
-        """Log a parsing error or unexpected frame — useful for detecting fuzzing."""
-        msg = (
-            f"{CYAN}[{self.protocol}]{RESET} "
-            f"{RED}ERROR{RESET}  "
-            f"{ip}:{port}  {message}"
-        )
+        """Log parsing error or malformed frame."""
+        msg = f"{CYAN}[{self.protocol}]{RESET} {RED}ERROR{RESET}  {ip}:{port}  {message}"
         self._logger.error(msg)
         self._write_event("error", ip, port, {"message": message})
 
     def info(self, message: str):
-        """Generic informational message (startup, shutdown, etc.)."""
+        """Informational message."""
         self._logger.info(f"{CYAN}[{self.protocol}]{RESET}  {message}")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _write_event(self, event_type: str, ip: str, port: int, extra: dict):
-        """
-        Append a single JSON object to events.jsonl.
-        Thread-safe via module-level lock.
-        """
+    def _write_event(self, event_type: str, ip: str, port: int, extra: Dict[str, Any]):
         event = {
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "protocol":  self.protocol,
             "event":     event_type,
             "src_ip":    ip,
@@ -235,11 +219,7 @@ class HoneypotLogger:
                 fh.write(json.dumps(event) + "\n")
 
     @staticmethod
-    def _identify_scanner(raw_bytes: bytes | None) -> str:
-        """
-        Compare the first packet against known scanner fingerprints.
-        Returns a descriptive string if matched, empty string otherwise.
-        """
+    def _identify_scanner(raw_bytes: Optional[bytes]) -> str:
         if not raw_bytes:
             return ""
         for signature, name in KNOWN_SCANNERS.items():
